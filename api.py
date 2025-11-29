@@ -4,9 +4,12 @@ HOCEBRANCH Modular Legal Engine
 """
 
 import os
+import re
 from datetime import datetime
 from typing import Optional, Union, List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,10 +19,66 @@ from dotenv import load_dotenv
 # Import the Prompt Library
 from prompts import PROMPT_MAP, CORE_LEGAL_BRAIN
 
+
+def clean_markdown_output(text: str) -> str:
+    """
+    Clean and format the markdown output from the AI.
+    Removes code block wrappers, normalizes whitespace, and ensures clean formatting.
+    """
+    if not text:
+        return text
+    
+    # Remove markdown code block wrappers if AI wrapped the entire document
+    # Handles cases like: ```markdown\n...\n``` or ```\n...\n```
+    text = text.strip()
+    
+    # Remove leading/trailing code block markers
+    if text.startswith("```"):
+        # Find the first newline after ```
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            # Check if it says "markdown" or just ```
+            marker = text[:first_newline].lower()
+            if "markdown" in marker or marker == "```":
+                text = text[first_newline + 1:]
+    
+    if text.endswith("```"):
+        text = text[:-3]
+    
+    # Remove any remaining leading/trailing whitespace
+    text = text.strip()
+    
+    # Normalize multiple consecutive newlines to maximum of 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Ensure consistent line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+    return text
+
 # Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI(title="HOCEBRANCH Modular Legal Engine", version="2.0.0")
+
+# Configure CORS
+# Allow requests from frontend applications
+origins = [
+    "http://localhost:3000",  # React development server
+    "http://localhost:3001",  # Alternative port
+    "http://127.0.0.1:3000",  # Alternative localhost format
+    "http://127.0.0.1:3001",
+    # Add your production frontend URL here when deployed
+    # "https://your-frontend-domain.com",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Get configuration from environment variables
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
@@ -82,11 +141,17 @@ async def health_check():
 
 
 @app.post("/api/generate-legal-draft")
-async def generate_draft(request: LegalRequest):
+async def generate_draft(
+    request: LegalRequest,
+    format: Optional[str] = Query(default="json", description="Response format: 'json' (default) or 'text' for plain markdown")
+):
     """
     Generate a legal document based on the provided parameters.
     
     Returns a legally binding document tailored to the corporate context and jurisdiction.
+    
+    Query Parameters:
+    - format: 'json' (default) returns JSON with metadata, 'text' returns plain markdown only
     """
     try:
         # Check if OpenAI API key is set
@@ -156,9 +221,21 @@ async def generate_draft(request: LegalRequest):
         chain = prompt | llm | StrOutputParser()
         result = chain.invoke({})  # No variables needed, already baked into the prompt!
 
+        # Clean the markdown output for better readability
+        cleaned_result = clean_markdown_output(result)
+
+        # If format=text, return plain markdown (easier to read in Postman/browser)
+        if format and format.lower() == "text":
+            return PlainTextResponse(
+                content=cleaned_result,
+                media_type="text/markdown",
+                headers={"Content-Disposition": f'inline; filename="{template_upper.lower()}_draft.md"'}
+            )
+
+        # Default: return JSON with metadata
         return {
             "success": True,
-            "draft_content": result,
+            "draft_content": cleaned_result,
             "metadata": {
                 "template_type": template_upper,
                 "applied_law": country,
